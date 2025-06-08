@@ -20,7 +20,6 @@ from source.py.utils import (
     compress_folder,
     download_cn_base_font,
     get_font_forge_bin,
-    get_font_name,
     is_ci,
     is_windows,
     match_unicode_names,
@@ -36,7 +35,7 @@ from source.py.feature import (
     normal_enabled_features,
 )
 
-FONT_VERSION = "v7.2"
+FONT_VERSION = "v7.4-dev"
 # =========================================================================================
 
 
@@ -46,12 +45,33 @@ def check_ftcli():
 
     if not package_installed:
         print(
-            f"❗ {package_name} is not found. Please run `pip install foundrytools-cli`"
+            f"❗ {package_name} is not found. Please run `pip install foundrytools-cli==1.1.22`"
         )
         exit(1)
 
 
 # =========================================================================================
+
+
+def parse_scale_factor(value) -> tuple[float, float]:
+    if isinstance(value, float):
+        return (value, value)
+    if isinstance(value, list):
+        return (float(value[0]), float(value[1]))
+
+    # Split the value by comma to handle width and height
+    parts = value.split(",")
+
+    if len(parts) == 1:
+        # Single number case
+        return float(parts[0]), float(parts[0])  # Same scale for width and height
+    elif len(parts) == 2:
+        # Two numbers case
+        return float(parts[0]), float(parts[1])
+    else:
+        raise argparse.ArgumentTypeError(
+            "Invalid scale factor format. Use <factor> or <w_factor>,<h_factor>."
+        )
 
 
 def parse_args(args: list[str] | None = None):
@@ -127,14 +147,19 @@ def parse_args(args: list[str] | None = None):
         help="Remove all the ligatures",
     )
     feature_group.add_argument(
+        "--nf-mono",
+        action="store_true",
+        help="Fixed Nerd Font icons' width",
+    )
+    feature_group.add_argument(
         "--cn-narrow",
         action="store_true",
-        help="Make CN characters narrow (And the font cannot be recogized as monospaced font)",
+        help="Make CN / JP characters narrow (And the font cannot be recogized as monospaced font)",
     )
     feature_group.add_argument(
         "--cn-scale-factor",
-        type=float,
-        help="Scale factor for CN glyphs (e.g. 1.1)",
+        type=parse_scale_factor,
+        help="Scale factor for CN / JP glyphs. Format: <factor> or <width_factor>,<height_factor> (e.g. 1.1 or 1.2,1.1)",
     )
 
     build_group = parser.add_argument_group("Build Options")
@@ -184,6 +209,11 @@ def parse_args(args: list[str] | None = None):
         help="Only build Regular / Bold / Italic / BoldItalic style",
     )
     build_group.add_argument(
+        "--font-patcher",
+        action="store_true",
+        help="Force the use of Nerd Font Patcher to build NF format",
+    )
+    build_group.add_argument(
         "--cache",
         action="store_true",
         help="Reuse font cache of TTF, OTF and Woff2 formats",
@@ -191,12 +221,12 @@ def parse_args(args: list[str] | None = None):
     build_group.add_argument(
         "--cn-rebuild",
         action="store_true",
-        help="Reinstantiate CN base font",
+        help="Reinstantiate variable CN base font",
     )
     build_group.add_argument(
         "--archive",
         action="store_true",
-        help="Build font archives with config and license. If has `--cache` flag, only archive Nerd-Font and CN formats",
+        help="Build font archives with config and license. If has `--cache` flag, only archive NF and CN formats",
     )
 
     return parser.parse_args(args)
@@ -292,7 +322,7 @@ class FontConfig:
             # whether to use pre-instantiated static CN font as base font
             "use_static_base_font": True,
             # scale factor for CN glyphs
-            "scale_factor": 1.0,
+            "scale_factor": (1.0, 1.0),
         }
         self.glyph_width = 600
         self.glyph_width_cn_narrow = 1000
@@ -337,6 +367,8 @@ class FontConfig:
                             if type(val) is not dict
                             else {**getattr(self, prop), **val},
                         )
+                if data["ligature"] is not None:
+                    self.enable_liga = data["ligature"]
 
         except FileNotFoundError:
             print(f"🚨 Config file not found: {config_file_path}, use default config")
@@ -374,6 +406,9 @@ class FontConfig:
         if args.nerd_font is not None:
             self.nerd_font["enable"] = args.nerd_font
 
+        if args.nf_mono:
+            self.nerd_font["mono"] = args.nf_mono
+
         if args.cn is not None:
             self.cn["enable"] = args.cn
 
@@ -382,12 +417,17 @@ class FontConfig:
 
         if args.cn_scale_factor:
             self.cn["scale_factor"] = args.cn_scale_factor
+        if isinstance(self.cn["scale_factor"], (float, list)):
+            self.cn["scale_factor"] = parse_scale_factor(self.cn["scale_factor"])
 
         if args.ttf_only:
             self.ttf_only = True
 
         if args.apply_fea_file:
             self.apply_fea_file = True
+
+        if args.font_patcher:
+            self.nerd_font["use_font_patcher"] = True
 
         if args.cn_rebuild:
             self.cn["clean_cache"] = True
@@ -513,11 +553,9 @@ class BuildOption:
         self.is_nf_built = False
         self.is_cn_built = False
         self.has_cache = (
-            self.__check_file_count(self.output_variable, count=2)
-            and self.__check_file_count(self.output_otf)
-            and self.__check_file_count(self.output_ttf)
-            and self.__check_file_count(self.output_ttf_hinted)
-            and self.__check_file_count(self.output_woff2)
+            self.__check_file_count(self.output_variable, minCount=2, end=".ttf")
+            and self.__check_file_count(self.output_ttf, minCount=4, end=".ttf")
+            and self.__check_file_count(self.output_ttf_hinted, minCount=4, end=".ttf")
         )
         self.github_mirror = environ.get("GITHUB", "github.com")
 
@@ -531,7 +569,9 @@ class BuildOption:
             self.cn_suffix = self.cn_suffix_compact = "CN"
         self.output_cn = joinPaths(self.output_dir, self.cn_suffix_compact)
 
-    def should_use_font_patcher(self, config: FontConfig) -> bool:
+    def should_use_font_patcher(
+        self, config: FontConfig, should_exit: bool = True
+    ) -> bool:
         if not (
             len(config.nerd_font["extra_args"]) > 0
             or config.nerd_font["use_font_patcher"]
@@ -539,14 +579,21 @@ class BuildOption:
         ):
             return False
 
-        if check_font_patcher(
-            version=config.nerd_font["version"],
-            github_mirror=self.github_mirror,
-        ) and not path.exists(config.nerd_font["font_forge_bin"]):
+        bin_path = config.nerd_font["font_forge_bin"]
+        if (not bin_path or not path.exists(bin_path)) and should_exit:
             print(
-                f"FontForge bin({config.nerd_font['font_forge_bin']}) not found. Use prebuild Nerd-Font base font instead."
+                f"FontForge bin ({bin_path}) not found, cannot build with Nerd Font Patcher"
             )
-            return False
+            exit(1)
+
+        if (
+            not check_font_patcher(
+                version=config.nerd_font["version"],
+                github_mirror=self.github_mirror,
+            )
+            and should_exit
+        ):
+            exit(1)
 
         return True
 
@@ -656,11 +703,13 @@ class BuildOption:
         print(f"Update {self.cn_static_dir}.sha256")
 
     def __check_file_count(
-        self, dir: str, count: int = 16, end: str | None = None
+        self, dir: str, minCount: int = 16, end: str | None = None
     ) -> bool:
         if not path.isdir(dir):
             return False
-        return len([f for f in listdir(dir) if end is None or f.endswith(end)]) == count
+        return (
+            len([f for f in listdir(dir) if end is None or f.endswith(end)]) >= minCount
+        )
 
 
 def handle_ligatures(
@@ -824,7 +873,7 @@ def get_unique_identifier(
 
 
 def change_glyph_width_or_scale(
-    font: TTFont, match_width: int, target_width: int, scale_factor: float
+    font: TTFont, match_width: int, target_width: int, scale_factor: tuple[float, float]
 ):
     font["hhea"].advanceWidthMax = target_width  # type: ignore
     for name in font.getGlyphOrder():
@@ -836,12 +885,13 @@ def change_glyph_width_or_scale(
             font["hmtx"][name] = (target_width, lsb)  # type: ignore
             continue
 
-        glyph.coordinates.scale((scale_factor, scale_factor))
+        scale_w, scale_h = scale_factor
+        glyph.coordinates.scale((scale_w, scale_h))
         glyph.xMin, glyph.yMin, glyph.xMax, glyph.yMax = (
             glyph.coordinates.calcIntBounds()
         )
 
-        scaled_width = int(round(width * scale_factor))
+        scaled_width = int(round(width * scale_w))
         delta = (target_width - scaled_width) / 2
 
         glyph.coordinates.translate((delta, 0))
@@ -1013,17 +1063,32 @@ def build_nf_by_font_patcher(
     if font_config.nerd_font["mono"]:
         _nf_args += ["--mono"]
 
-    _nf_args += font_config.nerd_font["extra_args"]
+    extra_args = font_config.nerd_font["extra_args"]
+    _nf_args += extra_args
 
-    run(_nf_args + [joinPaths(build_option.ttf_base_dir, font_basename)], log=True)
+    run(_nf_args + [joinPaths(build_option.ttf_base_dir, font_basename)])
+
     nf_file_name = "NerdFont"
-    if font_config.nerd_font["mono"]:
+    if (
+        font_config.nerd_font["mono"]
+        or "-s" in extra_args
+        or "--mono" in extra_args
+        or "--single-width-glyphs" in extra_args
+    ):
         nf_file_name += "Mono"
+    elif "--variable-width-glyphs" in extra_args:
+        nf_file_name += "Propo"
+
     _path = joinPaths(
         build_option.output_nf, font_basename.replace("-", f"{nf_file_name}-")
     )
     font = TTFont(_path)
     remove(_path)
+
+    # Check if the glyph 'nonmarkingreturn' exists in the font
+    extra_name = "nonmarkingreturn"
+    if extra_name in font.getGlyphNames():
+        font["hmtx"][extra_name] = (600, 0)  # type: ignore
     return font
 
 
@@ -1143,9 +1208,9 @@ def build_cn(f: str, font_config: FontConfig, build_option: BuildOption):
     target_width = (
         font_config.glyph_width_cn_narrow if font_config.cn["narrow"] else None
     )
-    scale_factor = (
+    scale_factor: tuple[float, float] | None = (
         font_config.cn["scale_factor"]
-        if font_config.cn["scale_factor"] != 1.0
+        if font_config.cn["scale_factor"] != (1.0, 1.0)
         else None
     )
     if target_width or scale_factor:
@@ -1164,9 +1229,9 @@ def build_cn(f: str, font_config: FontConfig, build_option: BuildOption):
             target_width = match_width
 
         if scale_factor:
-            print(f"Scale CN glyph to {scale_factor}x")
+            print(f"Scale CN / JP glyph to ({scale_factor[0]}x, {scale_factor[1]}x)")
         else:
-            scale_factor = 1
+            scale_factor = (1.0, 1.0)
 
         change_glyph_width_or_scale(
             font=cn_font,
@@ -1270,8 +1335,13 @@ def main(args: list[str] | None = None, version: str | None = None):
     build_option.load_cn_dir_and_suffix(font_config.should_build_nf_cn())
 
     if parsed_args.dry:
-        print("font_config:", json.dumps(font_config.__dict__, indent=4))
-        if not is_ci():
+        font_config.nerd_font["use_font_patcher"] = (
+            build_option.should_use_font_patcher(config=font_config, should_exit=False)
+        )
+        if is_ci():
+            print(json.dumps(font_config.__dict__, indent=4))
+        else:
+            print("font_config:", json.dumps(font_config.__dict__, indent=4))
             print("build_option:", json.dumps(build_option.__dict__, indent=4))
             print("parsed_args:", json.dumps(parsed_args.__dict__, indent=4))
         return
@@ -1328,7 +1398,8 @@ def main(args: list[str] | None = None, version: str | None = None):
                 is_variable=True,
                 fea_path=joinPaths(
                     build_option.src_dir,
-                    "features/italic.fea" if is_italic else "features/regular.fea",
+                    "features",
+                    "italic.fea" if is_italic else "regular.fea",
                 ),
             )
 
@@ -1343,7 +1414,7 @@ def main(args: list[str] | None = None, version: str | None = None):
                 postscript_name=postscript_name,
                 unique_identifier=get_unique_identifier(
                     font_config=font_config,
-                    postscript_name=get_font_name(font, 6),
+                    postscript_name=postscript_name,
                     variable=True,
                 ),
                 is_skip_subfamily=True,
@@ -1494,12 +1565,17 @@ def main(args: list[str] | None = None, version: str | None = None):
             if f == archive_dir_name or f.endswith(".json"):
                 continue
 
-            if should_use_cache and f not in ["CN", "NF", "NF-CN"]:
-                continue
+            suffix = ""
+            if f in ["CN", "NF", "NF-CN"]:
+                if not font_config.use_hinted:
+                    suffix = "-unhinted"
+            else:
+                if should_use_cache:
+                    continue
 
             sha256, zip_file_name_without_ext = compress_folder(
                 family_name_compact=font_config.family_name_compact,
-                suffix="-unhinted" if not font_config.use_hinted else "",
+                suffix=suffix,
                 source_file_or_dir_path=joinPaths(build_option.output_dir, f),
                 build_config_path=joinPaths(
                     build_option.output_dir, "build-config.json"

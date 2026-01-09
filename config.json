@@ -66,7 +66,7 @@
     "ss10": "ignore",
     "ss11": "enable",
     "zero": "ignore"
-  # },
+  },
   "nerd_font": {
     "enable": true,
     "version": "3.4.0",

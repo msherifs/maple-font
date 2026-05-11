@@ -1,6 +1,5 @@
 {
-  "$schema": "./source/schema.json",
-  "family_name": "Maple Mono",
+  "family_name": "Maple Cherry",
   "use_hinted": true,
   "pool_size": 4,
   "enable_ligature": true,
@@ -18,8 +17,8 @@
     "bold": 700,
     "extrabold": 800
   },
-  "line_height": 1.0,
-  "width": "default",
+  "line_height": 1,
+  "width": "narrow",
   "feature_freeze": {
     "cv01": "ignore",
     "cv02": "ignore",
@@ -58,7 +57,7 @@
     "cv99": "ignore",
     "ss01": "ignore",
     "ss02": "ignore",
-    "ss03": "ignore",
+    "ss03": "enable",
     "ss04": "ignore",
     "ss05": "ignore",
     "ss06": "ignore",
